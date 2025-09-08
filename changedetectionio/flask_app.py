@@ -42,6 +42,9 @@ from changedetectionio.api import Watch, WatchHistory, WatchSingleHistory, Creat
 from changedetectionio.api.Search import Search
 from .time_handler import is_within_schedule
 
+# OpenTelemetry instrumentation
+from changedetectionio.otel import setup_instrumentation, create_custom_metrics, setup_loguru_trace_correlation
+
 datastore = None
 
 # Local
@@ -632,6 +635,35 @@ def changedetection_app(config=None, datastore_o=None):
     if not os.getenv("GITHUB_REF", False) and not strtobool(os.getenv('DISABLE_VERSION_CHECK', 'no')) and not in_pytest:
         threading.Thread(target=check_for_new_version).start()
 
+    # Setup OpenTelemetry instrumentation
+    try:
+        otel_logger, tracer, meter = setup_instrumentation(
+            app,
+            service_name="changedetection.io",
+            service_version=__version__
+        )
+
+        # Create custom metrics for the application
+        custom_metrics = create_custom_metrics(meter)
+
+        # Store OpenTelemetry components in app config for use throughout the application
+        app.config['OTEL_LOGGER'] = otel_logger
+        app.config['OTEL_TRACER'] = tracer
+        app.config['OTEL_METER'] = meter
+        app.config['OTEL_METRICS'] = custom_metrics
+
+        # Setup loguru trace correlation
+        setup_loguru_trace_correlation()
+
+        logger.info("OpenTelemetry instrumentation initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize OpenTelemetry instrumentation: {e}")
+        # Continue without OpenTelemetry if setup fails
+        app.config['OTEL_LOGGER'] = None
+        app.config['OTEL_TRACER'] = None
+        app.config['OTEL_METER'] = None
+        app.config['OTEL_METRICS'] = None
+
     # Return the Flask app - the Socket.IO will be attached to it but initialized separately
     # This avoids circular dependencies
     return app
@@ -669,6 +701,12 @@ def notification_runner():
     global notification_debug_log
     from datetime import datetime
     import json
+
+    # Get OpenTelemetry components
+    tracer = app.config.get('OTEL_TRACER')
+    metrics = app.config.get('OTEL_METRICS')
+    otel_logger = app.config.get('OTEL_LOGGER')
+
     with app.app_context():
         while not app.config.exit.is_set():
             try:
@@ -678,43 +716,120 @@ def notification_runner():
                 time.sleep(1)
 
             else:
+                # Create span for notification processing
+                if tracer:
+                    with tracer.start_as_current_span("notification.send", attributes={
+                        "notification.watch_uuid": n_object.get('uuid', 'unknown'),
+                        "notification.watch_url": n_object.get('watch_url', 'unknown')
+                    }) as span:
+                        notification_start_time = time.time()
 
-                now = datetime.now()
-                sent_obj = None
+                        now = datetime.now()
+                        sent_obj = None
 
-                try:
-                    from changedetectionio.notification.handler import process_notification
+                        try:
+                            from changedetectionio.notification.handler import process_notification
 
-                    # Fallback to system config if not set
-                    if not n_object.get('notification_body') and datastore.data['settings']['application'].get('notification_body'):
-                        n_object['notification_body'] = datastore.data['settings']['application'].get('notification_body')
+                            # Fallback to system config if not set
+                            if not n_object.get('notification_body') and datastore.data['settings']['application'].get('notification_body'):
+                                n_object['notification_body'] = datastore.data['settings']['application'].get('notification_body')
 
-                    if not n_object.get('notification_title') and datastore.data['settings']['application'].get('notification_title'):
-                        n_object['notification_title'] = datastore.data['settings']['application'].get('notification_title')
+                            if not n_object.get('notification_title') and datastore.data['settings']['application'].get('notification_title'):
+                                n_object['notification_title'] = datastore.data['settings']['application'].get('notification_title')
 
-                    if not n_object.get('notification_format') and datastore.data['settings']['application'].get('notification_format'):
-                        n_object['notification_format'] = datastore.data['settings']['application'].get('notification_format')
-                    if n_object.get('notification_urls', {}):
-                        sent_obj = process_notification(n_object, datastore)
+                            if not n_object.get('notification_format') and datastore.data['settings']['application'].get('notification_format'):
+                                n_object['notification_format'] = datastore.data['settings']['application'].get('notification_format')
 
-                except Exception as e:
-                    logger.error(f"Watch URL: {n_object['watch_url']}  Error {str(e)}")
+                            if n_object.get('notification_urls', {}):
+                                sent_obj = process_notification(n_object, datastore)
 
-                    # UUID wont be present when we submit a 'test' from the global settings
-                    if 'uuid' in n_object:
-                        datastore.update_watch(uuid=n_object['uuid'],
-                                               update_obj={'last_notification_error': "Notification error detected, goto notification log."})
+                                # Record successful notification metric
+                                if metrics and 'notification_sent_total' in metrics:
+                                    metrics['notification_sent_total'].add(1, {
+                                        "status": "success"
+                                    })
 
-                    log_lines = str(e).splitlines()
-                    notification_debug_log += log_lines
+                                # Log successful notification
+                                if otel_logger:
+                                    otel_logger.info("Notification sent successfully", extra={
+                                        "watch_uuid": n_object.get('uuid'),
+                                        "watch_url": n_object.get('watch_url'),
+                                        "notification_type": "change_detected"
+                                    })
 
-                    with app.app_context():
-                        app.config['watch_check_update_SIGNAL'].send(app_context=app, watch_uuid=n_object.get('uuid'))
+                                span.set_attribute("notification.status", "success")
 
-                # Process notifications
-                notification_debug_log+= ["{} - SENDING - {}".format(now.strftime("%Y/%m/%d %H:%M:%S,000"), json.dumps(sent_obj))]
-                # Trim the log length
-                notification_debug_log = notification_debug_log[-100:]
+                        except Exception as e:
+                            from opentelemetry.trace import Status, StatusCode
+                            span.record_exception(e)
+                            span.set_status(Status(StatusCode.ERROR, str(e)))
+                            span.set_attribute("notification.status", "error")
+
+                            # Record failed notification metric
+                            if metrics and 'notification_sent_total' in metrics:
+                                metrics['notification_sent_total'].add(1, {
+                                    "status": "error"
+                                })
+
+                            logger.error(f"Watch URL: {n_object['watch_url']}  Error {str(e)}")
+
+                            # UUID wont be present when we submit a 'test' from the global settings
+                            if 'uuid' in n_object:
+                                datastore.update_watch(uuid=n_object['uuid'],
+                                                       update_obj={'last_notification_error': "Notification error detected, goto notification log."})
+
+                            log_lines = str(e).splitlines()
+                            notification_debug_log += log_lines
+
+                            with app.app_context():
+                                app.config['watch_check_update_SIGNAL'].send(app_context=app, watch_uuid=n_object.get('uuid'))
+
+                        # Record processing duration
+                        notification_duration = time.time() - notification_start_time
+                        span.set_attribute("notification.duration_seconds", notification_duration)
+
+                        # Process notifications
+                        notification_debug_log+= ["{} - SENDING - {}".format(now.strftime("%Y/%m/%d %H:%M:%S,000"), json.dumps(sent_obj))]
+                        # Trim the log length
+                        notification_debug_log = notification_debug_log[-100:]
+                else:
+                    # Fallback without tracing
+                    now = datetime.now()
+                    sent_obj = None
+
+                    try:
+                        from changedetectionio.notification.handler import process_notification
+
+                        # Fallback to system config if not set
+                        if not n_object.get('notification_body') and datastore.data['settings']['application'].get('notification_body'):
+                            n_object['notification_body'] = datastore.data['settings']['application'].get('notification_body')
+
+                        if not n_object.get('notification_title') and datastore.data['settings']['application'].get('notification_title'):
+                            n_object['notification_title'] = datastore.data['settings']['application'].get('notification_title')
+
+                        if not n_object.get('notification_format') and datastore.data['settings']['application'].get('notification_format'):
+                            n_object['notification_format'] = datastore.data['settings']['application'].get('notification_format')
+                        if n_object.get('notification_urls', {}):
+                            sent_obj = process_notification(n_object, datastore)
+
+                    except Exception as e:
+                        logger.error(f"Watch URL: {n_object['watch_url']}  Error {str(e)}")
+
+                        # UUID wont be present when we submit a 'test' from the global settings
+                        if 'uuid' in n_object:
+                            datastore.update_watch(uuid=n_object['uuid'],
+                                                   update_obj={'last_notification_error': "Notification error detected, goto notification log."})
+
+                        log_lines = str(e).splitlines()
+                        notification_debug_log += log_lines
+
+                        with app.app_context():
+                            app.config['watch_check_update_SIGNAL'].send(app_context=app, watch_uuid=n_object.get('uuid'))
+
+                    # Process notifications
+                    notification_debug_log+= ["{} - SENDING - {}".format(now.strftime("%Y/%m/%d %H:%M:%S,000"), json.dumps(sent_obj))]
+                    # Trim the log length
+                    notification_debug_log = notification_debug_log[-100:]
 
 
 
@@ -731,7 +846,7 @@ def ticker_thread_check_time_launch_checks():
 
     while not app.config.exit.is_set():
 
-        # Periodic worker health check (every 60 seconds)
+        # Periodic worker health check and metrics update (every 60 seconds)
         now = time.time()
         if now - last_health_check > 60:
             expected_workers = int(os.getenv("FETCH_WORKERS", datastore.data['settings']['requests']['workers']))
@@ -742,10 +857,28 @@ def ticker_thread_check_time_launch_checks():
                 app=app,
                 datastore=datastore
             )
-            
+
             if health_result['status'] != 'healthy':
                 logger.warning(f"Worker health check: {health_result['message']}")
-                
+
+            # Update queue size metrics
+            metrics = app.config.get('OTEL_METRICS')
+            if metrics and 'queue_size' in metrics:
+                try:
+                    update_queue_size = update_q.qsize()
+                    notification_queue_size = notification_q.qsize()
+
+                    metrics['queue_size'].add(update_queue_size, {"queue": "update"})
+                    metrics['queue_size'].add(notification_queue_size, {"queue": "notification"})
+
+                    # Also update active watches count
+                    if 'active_watches' in metrics:
+                        active_count = len([w for w in datastore.data['watching'].values() if w.get('paused') != True])
+                        metrics['active_watches'].add(active_count, {})
+
+                except Exception as e:
+                    logger.debug(f"Error updating queue metrics: {e}")
+
             last_health_check = now
 
         # Get a list of watches by UUID that are currently fetching data

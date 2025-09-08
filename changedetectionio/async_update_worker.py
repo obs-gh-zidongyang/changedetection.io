@@ -11,6 +11,8 @@ import queue
 import time
 
 from loguru import logger
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 
 # Async version of update_worker
 # Processes jobs from AsyncSignalPriorityQueue instead of threaded queue
@@ -32,7 +34,12 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore):
         task.set_name(f"async-worker-{worker_id}")
     
     logger.info(f"Starting async worker {worker_id}")
-    
+
+    # Get tracer and metrics from app config if available
+    tracer = app.config.get('OTEL_TRACER') if app else None
+    metrics = app.config.get('OTEL_METRICS') if app else None
+    otel_logger = app.config.get('OTEL_LOGGER') if app else None
+
     while not app.config.exit.is_set():
         update_handler = None
         watch = None
@@ -40,13 +47,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore):
         try:
             # Use native janus async interface - no threads needed!
             queued_item_data = await asyncio.wait_for(q.async_get(), timeout=1.0)
-            
+
         except asyncio.TimeoutError:
             # No jobs available, continue loop
             continue
         except Exception as e:
             logger.critical(f"CRITICAL: Worker {worker_id} failed to get queue item: {type(e).__name__}: {e}")
-            
+
             # Log queue health for debugging
             try:
                 queue_size = q.qsize()
@@ -54,17 +61,33 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore):
                 logger.critical(f"CRITICAL: Worker {worker_id} queue health - size: {queue_size}, empty: {is_empty}")
             except Exception as health_e:
                 logger.critical(f"CRITICAL: Worker {worker_id} queue health check failed: {health_e}")
-            
+
             await asyncio.sleep(0.1)
             continue
-        
+
         uuid = queued_item_data.item.get('uuid')
         fetch_start_time = round(time.time())
-        
+
         # Mark this UUID as being processed
         from changedetectionio import worker_handler
         worker_handler.set_uuid_processing(uuid, processing=True)
         
+        # Create a span for processing this watch
+        span_name = f"watch.check"
+        span_attributes = {
+            "worker.id": worker_id,
+            "watch.uuid": uuid,
+            "watch.priority": queued_item_data.priority
+        }
+
+        processing_start_time = time.time()
+
+        # Start tracing span if available
+        current_span = None
+        if tracer:
+            current_span = tracer.start_span(span_name, attributes=span_attributes)
+            current_span.__enter__()
+
         try:
             if uuid in list(datastore.data['watching'].keys()) and datastore.data['watching'][uuid].get('url'):
                 changed_detected = False
@@ -78,7 +101,28 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore):
 
                 watch = datastore.data['watching'].get(uuid)
 
+                # Add more span attributes if tracing is available
+                if current_span:
+                    current_span.set_attribute("watch.url", watch['url'])
+                    current_span.set_attribute("watch.processor", watch.get('processor', 'text_json_diff'))
+
                 logger.info(f"Worker {worker_id} processing watch UUID {uuid} Priority {queued_item_data.priority} URL {watch['url']}")
+
+                # Log to OpenTelemetry if available
+                if otel_logger:
+                    otel_logger.info(f"Processing watch check", extra={
+                        "worker_id": worker_id,
+                        "watch_uuid": uuid,
+                        "watch_url": watch['url'],
+                        "priority": queued_item_data.priority
+                    })
+
+                # Record metrics if available
+                if metrics and 'watch_checks_total' in metrics:
+                    metrics['watch_checks_total'].add(1, {
+                        "worker_id": str(worker_id),
+                        "processor": watch.get('processor', 'text_json_diff')
+                    })
 
                 try:
                     watch_check_update.send(watch_uuid=uuid)
@@ -102,6 +146,22 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore):
 
                     # Run change detection (this is synchronous)
                     changed_detected, update_obj, contents = update_handler.run_changedetection(watch=watch)
+
+                    # Record change detection metrics
+                    if metrics and 'watch_changes_detected' in metrics and changed_detected:
+                        metrics['watch_changes_detected'].add(1, {
+                            "worker_id": str(worker_id),
+                            "processor": watch.get('processor', 'text_json_diff')
+                        })
+
+                    # Log change detection result
+                    if otel_logger:
+                        otel_logger.info(f"Change detection completed", extra={
+                            "worker_id": worker_id,
+                            "watch_uuid": uuid,
+                            "change_detected": changed_detected,
+                            "processor": watch.get('processor', 'text_json_diff')
+                        })
 
                 except PermissionError as e:
                     logger.critical(f"File permission error updating file, watch: {uuid}")
@@ -376,18 +436,38 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore):
         except Exception as e:
             logger.error(f"Worker {worker_id} unexpected error processing {uuid}: {e}")
             logger.error(f"Worker {worker_id} traceback:", exc_info=True)
-            
+
+            # Record exception in span if available
+            if current_span:
+                current_span.record_exception(e)
+                current_span.set_status(Status(StatusCode.ERROR, str(e)))
+
             # Also update the watch with error information
             if datastore and uuid in datastore.data['watching']:
                 datastore.update_watch(uuid=uuid, update_obj={'last_error': f"Worker error: {str(e)}"})
-        
+
         finally:
+            # Complete the span and record metrics
+            processing_duration = time.time() - processing_start_time
+
+            if current_span:
+                current_span.set_attribute("processing.duration_seconds", processing_duration)
+                if 'changed_detected' in locals():
+                    current_span.set_attribute("watch.change_detected", changed_detected)
+                current_span.__exit__(None, None, None)
+
+            # Record processing time metric
+            if metrics and 'worker_processing_time' in metrics:
+                metrics['worker_processing_time'].record(processing_duration, {
+                    "worker_id": str(worker_id)
+                })
+
             # Always cleanup - this runs whether there was an exception or not
             if uuid:
                 try:
                     # Mark UUID as no longer being processed
                     worker_handler.set_uuid_processing(uuid, processing=False)
-                    
+
                     # Send completion signal
                     if watch:
                         #logger.info(f"Worker {worker_id} sending completion signal for UUID {watch['uuid']}")
@@ -397,7 +477,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore):
                     logger.debug(f"Worker {worker_id} completed watch {uuid} in {time.time()-fetch_start_time:.2f}s")
                 except Exception as cleanup_error:
                     logger.error(f"Worker {worker_id} error during cleanup: {cleanup_error}")
-            
+
             # Brief pause before continuing to avoid tight error loops (only on error)
             if 'e' in locals():
                 await asyncio.sleep(1.0)

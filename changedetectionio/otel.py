@@ -11,14 +11,34 @@ import os
 
 from flask import Flask
 from opentelemetry import metrics, trace
-from opentelemetry._logs import set_logger_provider
-from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+# Try importing from public API first, fallback to private API
+try:
+    from opentelemetry.logs import set_logger_provider
+except ImportError:
+    from opentelemetry._logs import set_logger_provider
+# Try importing from public API first, fallback to private API
+try:
+    from opentelemetry.exporter.otlp.proto.grpc.logs_exporter import OTLPLogExporter
+except ImportError:
+    try:
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+    except ImportError:
+        # If both fail, set to None and handle gracefully
+        OTLPLogExporter = None
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.flask import FlaskInstrumentor
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+# Try importing from public API first, fallback to private API
+try:
+    from opentelemetry.sdk.logs import LoggerProvider, LoggingHandler
+except ImportError:
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+# Try importing from public API first, fallback to private API
+try:
+    from opentelemetry.sdk.logs.export import BatchLogRecordProcessor
+except ImportError:
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import SERVICE_NAME, SERVICE_VERSION, Resource
@@ -138,14 +158,18 @@ def setup_logging(resource: Resource, otlp_endpoint: str, headers: dict | None =
     logger_provider = LoggerProvider(resource=resource)
     set_logger_provider(logger_provider)
 
-    # Create exporter with optional headers
-    exporter_kwargs = {"endpoint": otlp_endpoint}
-    if headers:
-        exporter_kwargs["headers"] = headers
+    # Create exporter with optional headers if available
+    if OTLPLogExporter is not None:
+        exporter_kwargs = {"endpoint": otlp_endpoint}
+        if headers:
+            exporter_kwargs["headers"] = headers
 
-    logger_provider.add_log_record_processor(
-        BatchLogRecordProcessor(OTLPLogExporter(**exporter_kwargs))
-    )
+        logger_provider.add_log_record_processor(
+            BatchLogRecordProcessor(OTLPLogExporter(**exporter_kwargs))
+        )
+    else:
+        # Log exporter not available, skip OTLP logging setup
+        print("Warning: OTLPLogExporter not available, skipping OTLP log export")
 
     # Create a handler for OpenTelemetry logs
     handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)

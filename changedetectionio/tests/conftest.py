@@ -95,6 +95,11 @@ def app(request):
 
     # So they don't delay in fetching
     os.environ["MINIMUM_SECONDS_RECHECK_TIME"] = "0"
+    
+    # Disable OpenTelemetry exports during testing to prevent connection issues
+    os.environ["OTEL_TRACES_EXPORTER"] = "none"
+    os.environ["OTEL_METRICS_EXPORTER"] = "none"
+    os.environ["OTEL_LOGS_EXPORTER"] = "none"
     try:
         os.mkdir(datastore_path)
     except FileExistsError:

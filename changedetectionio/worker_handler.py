@@ -10,6 +10,8 @@ import os
 import threading
 import time
 from loguru import logger
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
 
 # Global worker state
 running_async_tasks = []
@@ -95,31 +97,66 @@ def start_async_workers(n_workers, update_q, notification_q, app, datastore):
 async def start_single_async_worker(worker_id, update_q, notification_q, app, datastore):
     """Start a single async worker with auto-restart capability"""
     from changedetectionio.async_update_worker import async_update_worker
-    
+
+    # Get tracer from app config if available
+    tracer = app.config.get('OTEL_TRACER') if app else None
+
     # Check if we're in pytest environment - if so, be more gentle with logging
     import os
     in_pytest = "pytest" in os.sys.modules or "PYTEST_CURRENT_TEST" in os.environ
-    
-    while not app.config.exit.is_set():
-        try:
-            if not in_pytest:
-                logger.info(f"Starting async worker {worker_id}")
-            await async_update_worker(worker_id, update_q, notification_q, app, datastore)
-            # If we reach here, worker exited cleanly
-            if not in_pytest:
-                logger.info(f"Async worker {worker_id} exited cleanly")
-            break
-        except asyncio.CancelledError:
-            # Task was cancelled (normal shutdown)
-            if not in_pytest:
-                logger.info(f"Async worker {worker_id} cancelled")
-            break
-        except Exception as e:
-            logger.error(f"Async worker {worker_id} crashed: {e}")
-            if not in_pytest:
-                logger.info(f"Restarting async worker {worker_id} in 5 seconds...")
-            await asyncio.sleep(5)
-    
+
+    # Create a span for the worker lifecycle
+    if tracer:
+        with tracer.start_as_current_span(f"worker.lifecycle", attributes={
+            "worker.id": worker_id,
+            "worker.type": "async"
+        }) as span:
+            while not app.config.exit.is_set():
+                try:
+                    if not in_pytest:
+                        logger.info(f"Starting async worker {worker_id}")
+                    await async_update_worker(worker_id, update_q, notification_q, app, datastore)
+                    # If we reach here, worker exited cleanly
+                    if not in_pytest:
+                        logger.info(f"Async worker {worker_id} exited cleanly")
+                    break
+                except asyncio.CancelledError:
+                    # Task was cancelled (normal shutdown)
+                    span.set_attribute("worker.shutdown_reason", "cancelled")
+                    if not in_pytest:
+                        logger.info(f"Async worker {worker_id} cancelled")
+                    break
+                except Exception as e:
+                    span.record_exception(e)
+                    span.set_status(Status(StatusCode.ERROR, str(e)))
+                    logger.error(f"Async worker {worker_id} crashed: {e}")
+                    if not in_pytest:
+                        logger.info(f"Restarting async worker {worker_id} in 5 seconds...")
+                    await asyncio.sleep(5)
+
+            span.set_attribute("worker.shutdown_complete", True)
+    else:
+        # Fallback without tracing
+        while not app.config.exit.is_set():
+            try:
+                if not in_pytest:
+                    logger.info(f"Starting async worker {worker_id}")
+                await async_update_worker(worker_id, update_q, notification_q, app, datastore)
+                # If we reach here, worker exited cleanly
+                if not in_pytest:
+                    logger.info(f"Async worker {worker_id} exited cleanly")
+                break
+            except asyncio.CancelledError:
+                # Task was cancelled (normal shutdown)
+                if not in_pytest:
+                    logger.info(f"Async worker {worker_id} cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Async worker {worker_id} crashed: {e}")
+                if not in_pytest:
+                    logger.info(f"Restarting async worker {worker_id} in 5 seconds...")
+                await asyncio.sleep(5)
+
     if not in_pytest:
         logger.info(f"Async worker {worker_id} shutdown complete")
 

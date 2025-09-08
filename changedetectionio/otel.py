@@ -8,6 +8,7 @@ and preserve the application's simplicity.
 
 import logging
 import os
+from typing import Optional
 
 from flask import Flask
 from opentelemetry import metrics, trace
@@ -55,7 +56,7 @@ def get_otlp_endpoint() -> str:
     return os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 
 
-def get_otlp_headers() -> dict | None:
+def get_otlp_headers() -> Optional[dict]:
     """
     Get OTLP headers from environment variables.
 
@@ -68,7 +69,7 @@ def get_otlp_headers() -> dict | None:
     return None
 
 
-def setup_tracing(resource: Resource, otlp_endpoint: str, headers: dict | None = None) -> trace.Tracer:
+def setup_tracing(resource: Resource, otlp_endpoint: str, headers: Optional[dict] = None) -> trace.Tracer:
     """
     Set up OpenTelemetry tracing.
 
@@ -94,7 +95,7 @@ def setup_tracing(resource: Resource, otlp_endpoint: str, headers: dict | None =
     return trace.get_tracer(__name__)
 
 
-def setup_metrics(resource: Resource, otlp_endpoint: str, headers: dict | None = None) -> metrics.Meter:
+def setup_metrics(resource: Resource, otlp_endpoint: str, headers: Optional[dict] = None) -> metrics.Meter:
     """
     Set up OpenTelemetry metrics.
 
@@ -119,7 +120,7 @@ def setup_metrics(resource: Resource, otlp_endpoint: str, headers: dict | None =
     return metrics.get_meter(__name__)
 
 
-def setup_logging(resource: Resource, otlp_endpoint: str, headers: dict | None = None) -> logging.Logger:
+def setup_logging(resource: Resource, otlp_endpoint: str, headers: Optional[dict] = None) -> logging.Logger:
     """
     Set up OpenTelemetry logging.
 

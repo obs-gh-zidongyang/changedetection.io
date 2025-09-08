@@ -98,6 +98,13 @@ openapi-core[flask] >= 0.19.0
 
 loguru
 
+# OpenTelemetry dependencies for observability
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-flask
+opentelemetry-instrumentation-logging
+
 # For scraping all possible metadata relating to products so we can do better restock detection
 extruct
 
